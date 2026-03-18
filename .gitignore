@@ -1,0 +1,21 @@
+node_modules/
+
+# Env files with secrets
+.env
+.env.*
+env.txt
+env.local
+
+# Keep templates
+!env.example
+
+# Firebase / keys
+serviceAccountKey.json
+serviceAccountKey.b64
+*.pem
+*.p12
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
