@@ -1,0 +1,24 @@
+# Ignorar dependencias locales, se instalarán dentro del contenedor
+node_modules
+
+# Ignorar logs
+npm-debug.log
+yarn-error.log
+yarn-debug.log
+
+# Ignorar el directorio del repositorio de git
+.git
+.gitignore
+
+# Ignorar archivos de configuración del entorno local
+.env
+serviceAccountKey.json
+*.b64
+
+# Ignorar este mismo archivo y el Dockerfile
+.dockerignore
+Dockerfile
+
+# Ignorar archivos del sistema operativo
+.DS_Store
+Thumbs.db

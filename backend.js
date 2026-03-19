@@ -21,6 +21,24 @@ const APP_URL = firstDefined(
   `http://localhost:${PORT}`
 );
 const CRON_SECRET = process.env.CRON_SECRET || '';
+const AZURE_TENANT_ID = firstDefined(process.env.AZURE_TENANT_ID, process.env.TENANT_ID);
+const AZURE_CLIENT_ID = firstDefined(process.env.AZURE_CLIENT_ID, process.env.CLIENT_ID);
+const AZURE_CLIENT_SECRET = firstDefined(process.env.AZURE_CLIENT_SECRET, process.env.CLIENT_SECRET);
+const AZURE_SCOPE = firstDefined(
+  process.env.AZURE_SCOPE,
+  'openid profile email User.Read'
+);
+const AZURE_REDIRECT_URI = firstDefined(
+  process.env.AZURE_REDIRECT_URI,
+  `${APP_URL.replace(/\/+$/, '')}/auth/microsoft/callback`
+);
+
+const ADMIN_SESSION_COOKIE = '__session';
+const STUDENT_SESSION_COOKIE = '__student_session';
+const AZURE_STATE_COOKIE = '__azure_oauth_state';
+const AZURE_NONCE_COOKIE = '__azure_oauth_nonce';
+const AZURE_REDIRECT_COOKIE = '__azure_oauth_redirect';
+const DEFAULT_STUDENT_REDIRECT = '/app/dashboard-estudiante.html';
 
 const firebaseApp = initializeFirebaseAdmin();
 const db = firebaseApp.firestore();
@@ -31,6 +49,14 @@ app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use(cors(buildCorsConfig()));
+
+const FRONTEND_DIR = path.resolve(__dirname, 'frontend');
+if (fs.existsSync(FRONTEND_DIR)) {
+  app.use('/app', express.static(FRONTEND_DIR));
+  app.get('/portal', (_req, res) => {
+    res.sendFile(path.join(FRONTEND_DIR, 'index.html'));
+  });
+}
 
 function firstDefined(...values) {
   for (const value of values) {
@@ -266,8 +292,96 @@ function decodeSessionCookie(value) {
   }
 }
 
+function encodeSessionCookie(payload) {
+  return Buffer.from(JSON.stringify(payload)).toString('base64');
+}
+
+function decodeJwtPayload(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length < 2) return null;
+    const payload = Buffer.from(parts[1], 'base64url').toString('utf8');
+    return JSON.parse(payload);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function isAllowedStudentEmail(email) {
+  const value = String(email || '').trim().toLowerCase();
+  return value.endsWith('@alumnos.uacj.mx') || value.endsWith('@ulsaneza.edu.mx');
+}
+
+function createDeterministicStudentUid(email) {
+  const safe = String(email || '').trim().toLowerCase();
+  if (!safe) return '';
+  return 'STD_' + crypto.createHash('sha256').update(safe).digest('hex').slice(0, 24).toUpperCase();
+}
+
+function setCookie(res, name, value, maxAgeMs) {
+  res.cookie(name, value, {
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: maxAgeMs,
+    path: '/',
+  });
+}
+
+function clearCookie(res, name) {
+  res.clearCookie(name, {
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+  });
+}
+
+function clearAzureOauthCookies(res) {
+  clearCookie(res, AZURE_STATE_COOKIE);
+  clearCookie(res, AZURE_NONCE_COOKIE);
+  clearCookie(res, AZURE_REDIRECT_COOKIE);
+}
+
+function getLoginRedirectWithError(message) {
+  const safeMessage = encodeURIComponent(String(message || 'No se pudo iniciar sesion con Microsoft.'));
+  return `/app/login-estudiante.html?ms_error=${safeMessage}`;
+}
+
+function getStudentSessionFromRequest(req) {
+  const cookieValue =
+    req.cookies?.[STUDENT_SESSION_COOKIE] ||
+    getCookieFromHeader(req, STUDENT_SESSION_COOKIE);
+
+  if (!cookieValue) {
+    return { ok: false, status: 401, message: 'No hay sesion de estudiante.' };
+  }
+
+  const sessionData = decodeSessionCookie(cookieValue);
+  if (!sessionData || !sessionData.id || !sessionData.email) {
+    return { ok: false, status: 403, message: 'Sesion de estudiante invalida.' };
+  }
+
+  if (Date.now() > Number(sessionData.expiresAt || 0)) {
+    return { ok: false, status: 401, message: 'Sesion de estudiante expirada.' };
+  }
+
+  return {
+    ok: true,
+    claims: {
+      id: String(sessionData.id || ''),
+      name: String(sessionData.name || 'Estudiante'),
+      email: String(sessionData.email || '').toLowerCase(),
+      grupo: String(sessionData.grupo || ''),
+      provider: String(sessionData.provider || 'azure'),
+    },
+  };
+}
+
 async function verifyAdminSessionFromRequest(req) {
-  const cookieValue = req.cookies?.__session || getCookieFromHeader(req, '__session');
+  const cookieValue =
+    req.cookies?.[ADMIN_SESSION_COOKIE] ||
+    getCookieFromHeader(req, ADMIN_SESSION_COOKIE);
   if (!cookieValue) {
     return { ok: false, status: 401, message: 'No autorizado: no hay sesion.' };
   }
@@ -552,149 +666,427 @@ function createAdminCredentialsHtml(adminAccount, temporaryPassword) {
 }
 
 function createOverdueLoanHtmlBody({ studentName, materialName, loanDate, returnDate }) {
+  const student = studentName || 'Estudiante';
+  const material = materialName || 'Material';
+  const loanDateLabel = loanDate ? loanDate.toLocaleDateString('es-MX') : '-';
+  const returnDateLabel = returnDate ? returnDate.toLocaleDateString('es-MX') : '-';
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Alerta de prestamo vencido</h2>
-    <p>Hola ${studentName},</p>
-    <p>Se detecto un prestamo vencido:</p>
-    <ul>
-      <li>Material: ${materialName}</li>
-      <li>Fecha de prestamo: ${loanDate.toLocaleDateString('es-MX')}</li>
-      <li>Fecha esperada de devolucion: ${returnDate.toLocaleDateString('es-MX')}</li>
-    </ul>
-    <p>Revisa tus adeudos en el portal.</p>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #dc2626; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Adeudo por Prestamo Vencido</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>Se detecto un prestamo vencido y se genero un adeudo en tu cuenta.</p>
+
+      <div style="background-color: #fee2e2; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #dc2626;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Fecha de prestamo:</strong> ${loanDateLabel}</p>
+        <p style="margin: 5px 0;"><strong>Fecha de devolucion esperada:</strong> ${returnDateLabel}</p>
+      </div>
+
+      <div style="background-color: #dbeafe; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
+        <p style="margin: 0; font-size: 14px;">
+          Revisa tus adeudos para decidir si devolveras el material o liquidaras el pago correspondiente.
+        </p>
+      </div>
+
+      <p style="color: #6b7280; font-size: 12px; margin-top: 30px; text-align: center; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+        Este es un correo automatico del Sistema de Prestamos de Laboratorio.<br/>
+        Por favor no respondas a este mensaje.
+      </p>
+    </div>
   </div>`;
 }
 
 function createPaymentSuccessHtml({ studentName, materialName, amount, paymentCode, transactionId }) {
+  const student = studentName || 'Estudiante';
+  const material = materialName || 'Material';
+  const safeAmount = Number(amount || 0).toFixed(2);
+  const safePaymentCode = paymentCode || '-';
+  const safeTx = transactionId || '-';
+  const nowLabel = new Date().toLocaleString('es-MX');
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Pago exitoso</h2>
-    <p>Hola ${studentName}, tu pago fue aplicado correctamente.</p>
-    <ul>
-      <li>Material: ${materialName}</li>
-      <li>Monto: $${Number(amount).toFixed(2)} MXN</li>
-      <li>Codigo de pago: ${paymentCode}</li>
-      <li>Transaccion: ${transactionId}</li>
-    </ul>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #10b981; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Pago Exitoso</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>Tu pago ha sido procesado exitosamente y tu adeudo fue liquidado.</p>
+
+      <div style="background-color: #d1fae5; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #10b981;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Monto pagado:</strong> $${safeAmount} MXN</p>
+        <p style="margin: 5px 0;"><strong>Codigo de pago:</strong> ${safePaymentCode}</p>
+        <p style="margin: 5px 0;"><strong>ID de transaccion:</strong> ${safeTx}</p>
+        <p style="margin: 5px 0;"><strong>Fecha:</strong> ${nowLabel}</p>
+      </div>
+
+      <div style="background-color: #dbeafe; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
+        <p style="margin: 0; font-size: 14px;">
+          Estado actualizado: tu adeudo aparece como <strong>PAGADO</strong>.
+        </p>
+      </div>
+
+      <p style="color: #6b7280; font-size: 12px; margin-top: 30px; text-align: center; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+        Este es un correo automatico del Sistema de Prestamos de Laboratorio.<br/>
+        Conserva este mensaje como comprobante.
+      </p>
+    </div>
   </div>`;
 }
 
 function createLoanReturnConfirmedHtml({ studentName, materialName, quantity }) {
+  const student = studentName || 'Estudiante';
+  const material = materialName || 'Material';
+  const safeQuantity = Number(quantity || 0);
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Devolucion confirmada</h2>
-    <p>Hola ${studentName}, la devolucion fue registrada correctamente.</p>
-    <p>Material: ${materialName}</p>
-    <p>Cantidad: ${quantity}</p>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #10b981; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Devolucion Confirmada</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>La devolucion fue registrada correctamente.</p>
+
+      <div style="background-color: #d1fae5; padding: 15px; border-radius: 8px; margin: 20px 0;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Cantidad:</strong> ${safeQuantity}</p>
+        <p style="margin: 5px 0;"><strong>Estado:</strong> Devuelto</p>
+      </div>
+
+      <p style="color: #6b7280; font-size: 12px; margin-top: 30px; text-align: center; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+        Gracias por mantener tu historial al corriente.
+      </p>
+    </div>
   </div>`;
 }
 
 function createDebtReturnConfirmedHtml({ studentName, materialName, quantity, code }) {
+  const student = studentName || 'Estudiante';
+  const material = materialName || 'Material';
+  const safeQuantity = Number(quantity || 0);
+  const safeCode = code || '-';
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Adeudo resuelto por devolucion</h2>
-    <p>Hola ${studentName}, se confirmo la devolucion del material.</p>
-    <p>Material: ${materialName}</p>
-    <p>Cantidad: ${quantity}</p>
-    <p>Codigo: ${code}</p>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #10b981; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Material Devuelto - Adeudo Resuelto</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>Se confirmo la devolucion del material asociado a tu adeudo.</p>
+
+      <div style="background-color: #d1fae5; padding: 15px; border-radius: 8px; margin: 20px 0;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Cantidad:</strong> ${safeQuantity}</p>
+        <p style="margin: 5px 0;"><strong>Codigo:</strong> ${safeCode}</p>
+        <p style="margin: 5px 0;"><strong>Estado:</strong> Devuelto - Resuelto</p>
+      </div>
+
+      <p style="margin-top: 20px;">Ya no tienes pendientes por este adeudo.</p>
+    </div>
   </div>`;
 }
 
 function createDebtPaymentConfirmedHtml({ studentName, materialName, amount, paymentCode }) {
+  const student = studentName || 'Estudiante';
+  const material = materialName || 'Material';
+  const safeAmount = Number(amount || 0).toFixed(2);
+  const safePaymentCode = paymentCode || '-';
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Pago confirmado</h2>
-    <p>Hola ${studentName}, tu pago presencial ya fue registrado.</p>
-    <p>Material: ${materialName}</p>
-    <p>Monto: $${Number(amount).toFixed(2)} MXN</p>
-    <p>Codigo de pago: ${paymentCode}</p>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #10b981; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Pago Confirmado</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>El pago presencial fue confirmado correctamente.</p>
+
+      <div style="background-color: #d1fae5; padding: 15px; border-radius: 8px; margin: 20px 0;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Monto:</strong> $${safeAmount} MXN</p>
+        <p style="margin: 5px 0;"><strong>Codigo de pago:</strong> ${safePaymentCode}</p>
+        <p style="margin: 5px 0;"><strong>Estado:</strong> Pagado</p>
+      </div>
+
+      <p>Tu adeudo fue liquidado. Gracias por completar el proceso.</p>
+    </div>
   </div>`;
 }
 
 function createDebtGeneratedHtml({ studentName, materialName, quantity, amount, debtCode, dueDate }) {
+  const student = studentName || 'Estudiante';
+  const material = materialName || 'Material';
+  const safeQuantity = Number(quantity || 0);
+  const safeAmount = Number(amount || 0).toFixed(2);
+  const safeCode = debtCode || '-';
+  const dueDateLabel = dueDate ? dueDate.toLocaleString('es-MX') : '-';
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Adeudo generado</h2>
-    <p>Hola ${studentName}, se genero un adeudo por prestamo vencido.</p>
-    <ul>
-      <li>Material: ${materialName}</li>
-      <li>Cantidad: ${quantity}</li>
-      <li>Monto: $${Number(amount).toFixed(2)} MXN</li>
-      <li>Codigo: ${debtCode}</li>
-      <li>Vencimiento original: ${dueDate.toLocaleString('es-MX')}</li>
-    </ul>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #dc2626; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Nuevo Adeudo Generado</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>Se genero un adeudo porque el material no fue devuelto a tiempo.</p>
+
+      <div style="background-color: #fee2e2; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #dc2626;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Cantidad:</strong> ${safeQuantity}</p>
+        <p style="margin: 5px 0;"><strong>Monto estimado:</strong> $${safeAmount} MXN</p>
+        <p style="margin: 5px 0;"><strong>Codigo de adeudo:</strong> ${safeCode}</p>
+        <p style="margin: 5px 0;"><strong>Fecha de vencimiento original:</strong> ${dueDateLabel}</p>
+      </div>
+
+      <div style="background-color: #dbeafe; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
+        <p style="margin: 0; font-size: 14px;">
+          Opciones: devuelve el material en laboratorio o realiza el pago para liquidar el adeudo.
+        </p>
+      </div>
+
+      <p style="color: #6b7280; font-size: 12px; margin-top: 30px; text-align: center; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+        Este es un correo automatico del Sistema de Prestamos de Laboratorio.<br/>
+        Por favor no respondas a este mensaje.
+      </p>
+    </div>
   </div>`;
 }
 
 function createReminderHtml({ studentName, materialName, quantity, returnDate, code }) {
+  const student = studentName || 'Estudiante';
+  const material = materialName || 'Material';
+  const safeQuantity = Number(quantity || 0);
+  const safeCode = code || '-';
+  const returnDateLabel = returnDate
+    ? returnDate.toLocaleString('es-MX', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+    : '-';
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Recordatorio de devolucion</h2>
-    <p>Hola ${studentName}, tu prestamo vence en menos de 24 horas.</p>
-    <ul>
-      <li>Material: ${materialName}</li>
-      <li>Cantidad: ${quantity}</li>
-      <li>Fecha de devolucion: ${returnDate.toLocaleString('es-MX')}</li>
-      <li>Codigo: ${code}</li>
-    </ul>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #f59e0b; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Recordatorio de Devolucion</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>Tu prestamo vence en menos de 24 horas. Devuelvelo a tiempo para evitar adeudos.</p>
+
+      <div style="background-color: #fef3c7; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Cantidad:</strong> ${safeQuantity}</p>
+        <p style="margin: 5px 0;"><strong>Fecha de devolucion:</strong> ${returnDateLabel}</p>
+        <p style="margin: 5px 0;"><strong>Codigo:</strong> ${safeCode}</p>
+      </div>
+
+      <div style="background-color: #dbeafe; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
+        <p style="margin: 0; font-size: 14px;">
+          Usa tu QR de devolucion en laboratorio para completar el proceso.
+        </p>
+      </div>
+
+      <p style="color: #6b7280; font-size: 12px; margin-top: 30px; text-align: center; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+        Este es un correo automatico del Sistema de Prestamos de Laboratorio.<br/>
+        Por favor no respondas a este mensaje.
+      </p>
+    </div>
   </div>`;
 }
 
 function createFormRequestHtml({ studentName, materialName, quantity, debtCode, question, options, formUrl, qrImageUrl }) {
+  const student = studentName || 'Estudiante';
+  const material = materialName || 'Material';
+  const safeQuantity = Number(quantity || 0);
+  const safeCode = debtCode || '-';
+  const safeQuestion = question || 'Que sucedio con el material?';
+  const safeOptions = Array.isArray(options) ? options : [];
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Formulario de seguimiento</h2>
-    <p>Hola ${studentName}, necesitamos tu respuesta para resolver tu adeudo.</p>
-    <ul>
-      <li>Material: ${materialName}</li>
-      <li>Cantidad: ${quantity}</li>
-      <li>Codigo de adeudo: ${debtCode}</li>
-    </ul>
-    <p><strong>Pregunta:</strong> ${question}</p>
-    <p><strong>Opciones:</strong></p>
-    <ol>${options.map((option) => `<li>${option}</li>`).join('')}</ol>
-    <p><a href="${formUrl}">Completar formulario</a></p>
-    <p><img src="${qrImageUrl}" alt="QR formulario" style="max-width: 240px;" /></p>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #7c3aed; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Formulario de Seguimiento</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>Necesitamos tu respuesta para avanzar con la resolucion de tu adeudo.</p>
+
+      <div style="background-color: #fee2e2; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #dc2626;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Cantidad:</strong> ${safeQuantity}</p>
+        <p style="margin: 5px 0;"><strong>Codigo de adeudo:</strong> ${safeCode}</p>
+      </div>
+
+      <div style="background-color: #fef3c7; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
+        <p style="margin: 0; font-size: 14px;"><strong>Pregunta:</strong><br/>"${safeQuestion}"</p>
+      </div>
+
+      <div style="background-color: white; padding: 25px; border-radius: 8px; margin: 20px 0; text-align: center; border: 3px solid #7c3aed;">
+        <p style="margin-bottom: 15px; font-size: 16px;"><strong>Escanea este QR para responder:</strong></p>
+        <div style="background-color: #f3f4f6; padding: 20px; border-radius: 8px; display: inline-block;">
+          <img src="${qrImageUrl}" alt="Codigo QR del formulario" style="max-width: 300px; width: 100%; height: auto; display: block;" />
+        </div>
+        <p style="font-size: 14px; color: #374151; margin: 15px 0;"><strong>O usa el enlace directo:</strong></p>
+        <a href="${formUrl}" style="background-color: #7c3aed; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; display: inline-block; font-weight: bold;">
+          Completar formulario
+        </a>
+      </div>
+
+      <div style="background-color: #e0e7ff; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #6366f1;">
+        <p style="margin: 0; font-size: 14px; line-height: 1.7;">
+          <strong>Opciones disponibles:</strong><br/>
+          ${safeOptions.map((option, index) => `${index + 1}. ${option}`).join('<br/>')}
+        </p>
+      </div>
+
+      <p style="color: #6b7280; font-size: 12px; margin-top: 30px; text-align: center; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+        Este es un correo automatico del Sistema de Prestamos de Laboratorio.<br/>
+        Por favor no respondas a este mensaje.
+      </p>
+    </div>
   </div>`;
 }
 
 function createFormReturnQrHtml({ nombreEstudiante, nombreMaterial, cantidad, codigoAdeudo, qrUrl }) {
+  const student = nombreEstudiante || 'Estudiante';
+  const material = nombreMaterial || 'Material';
+  const safeQuantity = Number(cantidad || 0);
+  const safeCode = codigoAdeudo || '-';
+  const qrImageUrl = generateQRCodeDataURL(qrUrl);
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Codigo QR para devolucion</h2>
-    <p>Hola ${nombreEstudiante || 'Estudiante'}, aqui esta tu codigo de devolucion.</p>
-    <p>Material: ${nombreMaterial}</p>
-    <p>Cantidad: ${cantidad}</p>
-    <p>Codigo de adeudo: ${codigoAdeudo}</p>
-    <p><a href="${qrUrl}">${qrUrl}</a></p>
-    <p><img src="${generateQRCodeDataURL(qrUrl)}" alt="QR devolucion" style="max-width: 240px;" /></p>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #10b981; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Codigo QR de Devolucion</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>Registramos tu respuesta y te enviamos tu QR para devolver el material.</p>
+
+      <div style="background-color: #fef3c7; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Cantidad:</strong> ${safeQuantity}</p>
+        <p style="margin: 5px 0;"><strong>Codigo de adeudo:</strong> ${safeCode}</p>
+      </div>
+
+      <div style="background-color: white; padding: 25px; border-radius: 8px; margin: 20px 0; text-align: center; border: 3px solid #10b981;">
+        <p style="margin-bottom: 15px; font-size: 16px;"><strong>Tu codigo QR de devolucion:</strong></p>
+        <div style="background-color: #f3f4f6; padding: 20px; border-radius: 8px; display: inline-block;">
+          <img src="${qrImageUrl}" alt="Codigo QR de devolucion" style="max-width: 300px; width: 100%; height: auto; display: block;" />
+        </div>
+        <p style="font-size: 11px; color: #6b7280; margin-top: 15px; padding: 10px; background-color: #f9fafb; border-radius: 4px; word-break: break-all; font-family: monospace;">
+          ${qrUrl}
+        </p>
+      </div>
+
+      <p style="color: #6b7280; font-size: 12px; margin-top: 30px; text-align: center; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+        Este es un correo automatico del Sistema de Prestamos de Laboratorio.<br/>
+        Por favor no respondas a este mensaje.
+      </p>
+    </div>
   </div>`;
 }
 
 function createFormPaymentLinkHtml({ nombreEstudiante, nombreMaterial, cantidad, monto, respuesta, paymentUrl }) {
+  const student = nombreEstudiante || 'Estudiante';
+  const material = nombreMaterial || 'Material';
+  const safeQuantity = Number(cantidad || 0);
+  const safeAmount = Number(monto || 0).toFixed(2);
+  const safeAnswer = respuesta || 'No definida';
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Pago en linea</h2>
-    <p>Hola ${nombreEstudiante || 'Estudiante'}, registramos tu respuesta: "${respuesta}".</p>
-    <p>Material: ${nombreMaterial}</p>
-    <p>Cantidad: ${cantidad}</p>
-    <p>Monto: $${monto} MXN</p>
-    <p><a href="${paymentUrl}">Pagar ahora</a></p>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #3b82f6; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Realizar Pago en Linea</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>Registramos tu respuesta: <strong>"${safeAnswer}"</strong>.</p>
+
+      <div style="background-color: #fee2e2; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #dc2626;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Cantidad:</strong> ${safeQuantity}</p>
+        <p style="margin: 5px 0;"><strong>Monto a pagar:</strong> $${safeAmount} MXN</p>
+      </div>
+
+      <div style="text-align: center; margin: 30px 0;">
+        <a href="${paymentUrl}" style="background-color: #3b82f6; color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; display: inline-block; font-weight: bold;">
+          Pagar ahora
+        </a>
+      </div>
+
+      <div style="background-color: #dbeafe; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
+        <p style="margin: 0; font-size: 14px;">
+          Una vez completado el pago, tu adeudo se actualizara automaticamente.
+        </p>
+      </div>
+    </div>
   </div>`;
 }
 
 function createFormPaymentQrHtml({ nombreEstudiante, nombreMaterial, cantidad, monto, codigoAdeudo, respuesta, qrUrl }) {
+  const student = nombreEstudiante || 'Estudiante';
+  const material = nombreMaterial || 'Material';
+  const safeQuantity = Number(cantidad || 0);
+  const safeAmount = Number(monto || 0).toFixed(2);
+  const safeCode = codigoAdeudo || '-';
+  const safeAnswer = respuesta || 'No definida';
+  const qrImageUrl = generateQRCodeDataURL(qrUrl);
+
   return `
-  <div style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Codigo QR para pago presencial</h2>
-    <p>Hola ${nombreEstudiante || 'Estudiante'}, registramos tu respuesta: "${respuesta}".</p>
-    <p>Material: ${nombreMaterial}</p>
-    <p>Cantidad: ${cantidad}</p>
-    <p>Monto: $${monto} MXN</p>
-    <p>Codigo de adeudo: ${codigoAdeudo}</p>
-    <p><a href="${qrUrl}">${qrUrl}</a></p>
-    <p><img src="${generateQRCodeDataURL(qrUrl)}" alt="QR pago" style="max-width: 240px;" /></p>
+  <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+    <div style="background-color: #10b981; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+      <h2 style="color: white; margin: 0;">Codigo QR de Pago Presencial</h2>
+    </div>
+
+    <div style="background-color: #f9fafb; padding: 20px; border-radius: 0 0 8px 8px;">
+      <p>Hola <strong>${student}</strong>,</p>
+      <p>Registramos tu respuesta: <strong>"${safeAnswer}"</strong>.</p>
+
+      <div style="background-color: #fee2e2; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #dc2626;">
+        <p style="margin: 5px 0;"><strong>Material:</strong> ${material}</p>
+        <p style="margin: 5px 0;"><strong>Cantidad:</strong> ${safeQuantity}</p>
+        <p style="margin: 5px 0;"><strong>Monto a pagar:</strong> $${safeAmount} MXN</p>
+        <p style="margin: 5px 0;"><strong>Codigo de adeudo:</strong> ${safeCode}</p>
+      </div>
+
+      <div style="background-color: white; padding: 25px; border-radius: 8px; margin: 20px 0; text-align: center; border: 3px solid #10b981;">
+        <p style="margin-bottom: 15px; font-size: 16px;"><strong>Tu codigo QR de pago:</strong></p>
+        <div style="background-color: #f3f4f6; padding: 20px; border-radius: 8px; display: inline-block;">
+          <img src="${qrImageUrl}" alt="Codigo QR de pago presencial" style="max-width: 300px; width: 100%; height: auto; display: block;" />
+        </div>
+        <p style="font-size: 11px; color: #6b7280; margin-top: 15px; padding: 10px; background-color: #f9fafb; border-radius: 4px; word-break: break-all; font-family: monospace;">
+          ${qrUrl}
+        </p>
+      </div>
+
+      <div style="background-color: #dbeafe; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
+        <p style="margin: 0; font-size: 14px; line-height: 1.8;">
+          Instrucciones: presenta este codigo en caja, realiza el pago y espera la confirmacion del encargado.
+        </p>
+      </div>
+    </div>
   </div>`;
 }
 
@@ -1307,6 +1699,223 @@ async function runEstadisticasBasicas() {
   return stats;
 }
 
+app.get('/auth/microsoft/start', (req, res) => {
+  if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET) {
+    return res.status(500).json({
+      success: false,
+      message: 'Azure OAuth no esta configurado. Revisa AZURE_TENANT_ID, AZURE_CLIENT_ID y AZURE_CLIENT_SECRET.',
+    });
+  }
+
+  const rawRedirect = String(req.query.redirect || DEFAULT_STUDENT_REDIRECT).trim();
+  const redirectTarget = rawRedirect.startsWith('/') ? rawRedirect : DEFAULT_STUDENT_REDIRECT;
+
+  const state = randomHex(24);
+  const nonce = randomHex(24);
+
+  setCookie(res, AZURE_STATE_COOKIE, state, 10 * 60 * 1000);
+  setCookie(res, AZURE_NONCE_COOKIE, nonce, 10 * 60 * 1000);
+  setCookie(res, AZURE_REDIRECT_COOKIE, redirectTarget, 10 * 60 * 1000);
+
+  const params = new URLSearchParams({
+    client_id: AZURE_CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: AZURE_REDIRECT_URI,
+    response_mode: 'query',
+    scope: AZURE_SCOPE,
+    state,
+    nonce,
+    prompt: 'select_account',
+  });
+
+  const authorizeUrl =
+    `https://login.microsoftonline.com/${encodeURIComponent(AZURE_TENANT_ID)}/oauth2/v2.0/authorize?` +
+    params.toString();
+
+  return res.redirect(authorizeUrl);
+});
+
+app.get('/auth/microsoft/callback', async (req, res) => {
+  const errorFromAzure = String(req.query.error || '').trim();
+  const errorDescription = String(req.query.error_description || '').trim();
+  const redirectCookie =
+    req.cookies?.[AZURE_REDIRECT_COOKIE] ||
+    getCookieFromHeader(req, AZURE_REDIRECT_COOKIE);
+  const redirectTarget = String(redirectCookie || DEFAULT_STUDENT_REDIRECT).startsWith('/')
+    ? String(redirectCookie || DEFAULT_STUDENT_REDIRECT)
+    : DEFAULT_STUDENT_REDIRECT;
+
+  const failWithRedirect = (message) => {
+    clearAzureOauthCookies(res);
+    return res.redirect(getLoginRedirectWithError(message));
+  };
+
+  if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET) {
+    return failWithRedirect('Azure OAuth no esta configurado en el backend.');
+  }
+
+  if (errorFromAzure) {
+    return failWithRedirect(errorDescription || errorFromAzure);
+  }
+
+  const code = String(req.query.code || '').trim();
+  const state = String(req.query.state || '').trim();
+  const stateCookie = String(
+    req.cookies?.[AZURE_STATE_COOKIE] ||
+    getCookieFromHeader(req, AZURE_STATE_COOKIE) ||
+    ''
+  ).trim();
+  const nonceCookie = String(
+    req.cookies?.[AZURE_NONCE_COOKIE] ||
+    getCookieFromHeader(req, AZURE_NONCE_COOKIE) ||
+    ''
+  ).trim();
+
+  if (!code || !state) {
+    return failWithRedirect('La respuesta de Microsoft no incluyo codigo de autorizacion.');
+  }
+
+  if (!stateCookie || state !== stateCookie) {
+    return failWithRedirect('Estado OAuth invalido. Intenta de nuevo.');
+  }
+
+  try {
+    const tokenEndpoint =
+      `https://login.microsoftonline.com/${encodeURIComponent(AZURE_TENANT_ID)}/oauth2/v2.0/token`;
+
+    const tokenPayload = new URLSearchParams({
+      client_id: AZURE_CLIENT_ID,
+      client_secret: AZURE_CLIENT_SECRET,
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: AZURE_REDIRECT_URI,
+      scope: AZURE_SCOPE,
+    });
+
+    const tokenResponse = await fetch(tokenEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: tokenPayload.toString(),
+    });
+
+    const tokenData = await tokenResponse.json().catch(() => ({}));
+    if (!tokenResponse.ok) {
+      const errorMessage =
+        tokenData.error_description ||
+        tokenData.error ||
+        'No se pudo completar el intercambio de token con Microsoft.';
+      return failWithRedirect(errorMessage);
+    }
+
+    const claims = decodeJwtPayload(tokenData.id_token);
+    if (!claims) {
+      return failWithRedirect('Token de identidad invalido.');
+    }
+
+    if (nonceCookie && String(claims.nonce || '') !== nonceCookie) {
+      return failWithRedirect('Nonce OAuth invalido. Intenta de nuevo.');
+    }
+
+    const email = String(
+      claims.preferred_username ||
+      claims.email ||
+      claims.upn ||
+      ''
+    ).trim().toLowerCase();
+
+    if (!isValidEmail(email)) {
+      return failWithRedirect('Microsoft no devolvio un correo valido para esta cuenta.');
+    }
+
+    if (!isAllowedStudentEmail(email)) {
+      return failWithRedirect('Tu correo no tiene permisos para ingresar como estudiante.');
+    }
+
+    const name = String(claims.name || email.split('@')[0] || 'Estudiante').trim();
+    const uid = String(claims.oid || claims.sub || createDeterministicStudentUid(email)).trim();
+    const grupo = extractGrupoFromEmail(email) || '';
+
+    await createOrUpdateStudentServer({
+      id: uid,
+      name,
+      email,
+      grupo,
+      rol: 'estudiante',
+      carrera: 'turismo',
+      image: '',
+    });
+
+    const sessionData = {
+      id: uid,
+      name,
+      email,
+      grupo,
+      provider: 'azure',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 5 * 24 * 60 * 60 * 1000,
+    };
+
+    setCookie(
+      res,
+      STUDENT_SESSION_COOKIE,
+      encodeSessionCookie(sessionData),
+      5 * 24 * 60 * 60 * 1000
+    );
+
+    clearAzureOauthCookies(res);
+    return res.redirect(redirectTarget);
+  } catch (error) {
+    console.error('[AZURE_OAUTH] Error en callback:', error.message);
+    return failWithRedirect('No se pudo completar el inicio de sesion con Microsoft.');
+  }
+});
+
+app.get('/api/student/session', asyncHandler(async (req, res) => {
+  const session = getStudentSessionFromRequest(req);
+  if (!session.ok) {
+    if (session.status === 401 || session.status === 403) {
+      clearCookie(res, STUDENT_SESSION_COOKIE);
+    }
+    return res.status(session.status).json({
+      success: false,
+      message: session.message,
+    });
+  }
+
+  const studentDoc = await db.collection('Estudiantes').doc(session.claims.id).get();
+  if (!studentDoc.exists) {
+    clearCookie(res, STUDENT_SESSION_COOKIE);
+    return res.status(404).json({
+      success: false,
+      message: 'La sesion existe, pero el estudiante no fue encontrado.',
+    });
+  }
+
+  const studentData = studentDoc.data() || {};
+  const payload = {
+    id: session.claims.id,
+    name: String(studentData.nombre || session.claims.name || 'Estudiante'),
+    email: String(studentData.correo || session.claims.email || '').toLowerCase(),
+    grupo: String(studentData.grupo || session.claims.grupo || ''),
+    provider: session.claims.provider || 'azure',
+  };
+
+  return res.status(200).json({
+    success: true,
+    student: payload,
+  });
+}));
+
+app.post('/api/student/session/logout', (_req, res) => {
+  clearCookie(res, STUDENT_SESSION_COOKIE);
+  return res.status(200).json({
+    success: true,
+    message: 'Sesion de estudiante cerrada.',
+  });
+});
+
 app.get('/', (_req, res) => {
   res.status(200).json({
     ok: true,
@@ -1321,6 +1930,7 @@ app.get('/health', (_req, res) => {
     firebase: true,
     realtimeDb: Boolean(rtdb),
     emailConfigured: Boolean(getEmailTransporter()),
+    azureOauthConfigured: Boolean(AZURE_TENANT_ID && AZURE_CLIENT_ID && AZURE_CLIENT_SECRET),
   });
 });
 
@@ -1363,6 +1973,33 @@ app.post(
 
     await createOrUpdateStudentServer(user);
     return res.status(200).json({ ok: true, message: 'Usuario creado/actualizado.' });
+  })
+);
+
+app.get(
+  '/api/estudiantes/buscar',
+  asyncHandler(async (req, res) => {
+    const email = String(req.query.email || '').trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({
+        found: false,
+        message: 'El correo es requerido.',
+      });
+    }
+
+    const student = await findStudentByEmail(email);
+    if (!student) {
+      return res.status(404).json({
+        found: false,
+        message: 'No existe un estudiante con ese correo.',
+      });
+    }
+
+    return res.status(200).json({
+      found: true,
+      uid: student.id,
+      student: student.data || {},
+    });
   })
 );
 
@@ -2305,13 +2942,12 @@ app.post(
       expiresAt: nowMillis + 5 * 24 * 60 * 60 * 1000,
     };
 
-    res.cookie('__session', Buffer.from(JSON.stringify(sessionData)).toString('base64'), {
-      httpOnly: true,
-      secure: NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 5 * 24 * 60 * 60 * 1000,
-      path: '/',
-    });
+    setCookie(
+      res,
+      ADMIN_SESSION_COOKIE,
+      encodeSessionCookie(sessionData),
+      5 * 24 * 60 * 60 * 1000
+    );
 
     return res.status(200).json({
       success: true,
@@ -2321,13 +2957,20 @@ app.post(
   })
 );
 
+app.get(
+  '/api/admin/session',
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    return res.status(200).json({
+      success: true,
+      admin: req.adminClaims || {},
+    });
+  })
+);
+
 app.post('/api/auth/session/logout', (_req, res) => {
-  res.clearCookie('__session', {
-    httpOnly: true,
-    secure: NODE_ENV === 'production',
-    sameSite: 'lax',
-    path: '/',
-  });
+  clearCookie(res, ADMIN_SESSION_COOKIE);
+  clearCookie(res, STUDENT_SESSION_COOKIE);
   return res.status(200).json({ success: true, message: 'Sesion cerrada.' });
 });
 
